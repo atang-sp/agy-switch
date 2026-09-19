@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agy-switch"
+version = "0.1.0"
+authors = [
+  { name="Antigravity User", email="user@example.com" },
+]
+description = "Multi-account manager & switcher for Google Antigravity CLI and Gemini"
+readme = "README.md"
+requires-python = ">=3.7"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "keyring>=24.0.0",
+]
+
+[project.scripts]
+agy-switch = "agy_switch:main"
+gemini-switch = "agy_switch:main"
