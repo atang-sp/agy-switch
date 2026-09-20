@@ -10,8 +10,13 @@ import json
 import base64
 import argparse
 import subprocess
-from datetime import datetime
+import math
+import re
+import shutil
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib import request, parse, error
 
 try:
     import keyring
@@ -35,6 +40,200 @@ RED = "\033[91m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
 RESET = "\033[0m"
+
+# The regular cloudcode-pa host can return an availability-style all-100 Gemini
+# response for these accounts. agy uses the daily host for account quota; do not
+# fall back to a different host and risk displaying misleading data.
+QUOTA_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
+OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+_OAUTH_CLIENTS = None
+
+
+class QuotaError(Exception):
+    pass
+
+
+def oauth_clients():
+    """Discover agy's installed OAuth client without storing it in source control."""
+    global _OAUTH_CLIENTS
+    if _OAUTH_CLIENTS is not None:
+        return _OAUTH_CLIENTS
+
+    candidates = []
+    env_id = os.environ.get("AGY_OAUTH_CLIENT_ID")
+    env_secret = os.environ.get("AGY_OAUTH_CLIENT_SECRET")
+    if env_id and env_secret:
+        candidates.append((env_id, env_secret))
+
+    binary = os.environ.get("AGY_BIN") or shutil.which("agy")
+    if binary:
+        try:
+            content = Path(binary).read_bytes()
+            client_ids = list(dict.fromkeys(match.decode("ascii") for match in re.findall(
+                rb"[0-9]+-[a-z0-9]+\.apps\.googleusercontent\.com", content)))
+            client_secrets = list(dict.fromkeys(match.decode("ascii") for match in re.findall(
+                rb"GOCSPX-[A-Za-z0-9_-]{28}", content)))
+            for client_id in client_ids:
+                for client_secret in client_secrets:
+                    pair = (client_id, client_secret)
+                    if pair not in candidates:
+                        candidates.append(pair)
+        except (OSError, ValueError):
+            pass
+
+    _OAUTH_CLIENTS = candidates
+    return candidates
+
+
+def parse_time(value):
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.astimezone()
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def format_reset(value):
+    dt = parse_time(value)
+    if dt is None:
+        return "重置时间未知"
+    minutes = math.ceil((dt - datetime.now(timezone.utc)).total_seconds() / 60)
+    if minutes <= 0:
+        return "已到期"
+    if minutes < 60:
+        return f"{minutes} 分钟后"
+    if minutes < 1440:
+        return f"{minutes // 60} 小时 {minutes % 60} 分钟后"
+    return f"{minutes // 1440} 天 {minutes % 1440 // 60} 小时后"
+
+
+def quota_bar(fraction, width=14):
+    filled = max(0, min(width, round(fraction * width)))
+    if fraction >= 0.5:
+        color = GREEN
+    elif fraction >= 0.2:
+        color = YELLOW
+    else:
+        color = RED
+    return f"{color}{'█' * filled}{DIM}{'░' * (width - filled)}{RESET}"
+
+
+def post_json(url, body, headers):
+    req = request.Request(url, data=body, headers=headers, method="POST")
+    with request.urlopen(req, timeout=12) as response:
+        result = json.load(response)
+    if not isinstance(result, dict):
+        raise QuotaError("额度接口返回格式异常")
+    return result
+
+
+def refresh_quota_token(data):
+    token = data.get("token", {})
+    if not token.get("refresh_token"):
+        raise QuotaError("登录已过期且无刷新凭证，请重新登录")
+    if data.get("auth_method", "consumer") != "consumer":
+        raise QuotaError("此认证类型暂不支持自动刷新，请通过 agy 更新登录")
+    clients = oauth_clients()
+    if not clients:
+        raise QuotaError("未找到 agy 的 OAuth 客户端配置，请通过 agy 重新登录")
+    last_error = None
+    for client_id, client_secret in clients:
+        body = parse.urlencode({
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": token["refresh_token"],
+            "grant_type": "refresh_token",
+        }).encode()
+        try:
+            result = post_json(OAUTH_TOKEN_URL, body,
+                               {"Content-Type": "application/x-www-form-urlencoded"})
+        except error.HTTPError as exc:
+            last_error = exc.code
+            continue
+        if result.get("access_token"):
+            # Query with a temporary token; never replace another process's login state.
+            return result["access_token"]
+        last_error = "invalid response"
+    if isinstance(last_error, int):
+        raise QuotaError(f"刷新登录失败 (HTTP {last_error})，请通过 agy 重新登录")
+    raise QuotaError("刷新登录未返回访问凭证，请通过 agy 重新登录")
+
+
+def fetch_quota(data):
+    """Read each account independently; errors never expose response bodies/tokens."""
+    try:
+        if not isinstance(data, dict) or not isinstance(data.get("token"), dict):
+            raise QuotaError("未找到有效的账号凭证")
+        token = data["token"]
+        access = token.get("access_token")
+        expiry = parse_time(token.get("expiry"))
+        refreshed = not access or (expiry and expiry <= datetime.now(timezone.utc))
+        if refreshed:
+            access = refresh_quota_token(data)
+        def query():
+            return post_json(QUOTA_URL, b"{}", {
+                "Authorization": "Bearer " + access,
+                "Content-Type": "application/json", "User-Agent": "antigravity",
+            })
+        try:
+            result = query()
+        except error.HTTPError as exc:
+            if exc.code != 401 or refreshed:
+                raise
+            access = refresh_quota_token(data)
+            result = query()
+        groups = result.get("groups", [])
+        if not groups and result.get("buckets"):
+            groups = [{"displayName": "模型额度", "buckets": result["buckets"]}]
+        if not isinstance(groups, list) or any(
+            not isinstance(g, dict) or not isinstance(g.get("buckets", []), list)
+            or any(not isinstance(b, dict) for b in g.get("buckets", [])) for g in groups
+        ):
+            raise QuotaError("额度接口返回格式异常")
+        return {"groups": groups}
+    except QuotaError as exc:
+        return {"error": str(exc)}
+    except error.HTTPError as exc:
+        return {"error": f"额度查询失败 (HTTP {exc.code})"}
+    except (error.URLError, TimeoutError, OSError):
+        return {"error": "额度查询超时或网络不可用"}
+    except (ValueError, TypeError):
+        return {"error": "额度接口返回格式异常"}
+
+
+def format_bucket(bucket):
+    if not bucket:
+        return "未提供"
+    fraction = bucket.get("remainingFraction")
+    if isinstance(fraction, (float, int)) and not isinstance(fraction, bool) and math.isfinite(fraction) and 0 <= fraction <= 1:
+        remaining = fraction * 100
+        percentage = f"{quota_bar(fraction)} {remaining:.1f}% 剩余"
+        if bucket.get("disabled"):
+            return f"{percentage}  · 当前不适用"
+    else:
+        percentage = "未提供"
+        if bucket.get("disabled"):
+            return "当前不适用"
+    return f"{percentage}  · 重置 {format_reset(bucket.get('resetTime'))}"
+
+
+def print_quota(result, indent="    "):
+    if result.get("error"):
+        print(f"{indent}{YELLOW}{result['error']}{RESET}")
+        return
+    if not result.get("groups"):
+        print(f"{indent}5h / 一周额度: 接口未提供")
+    for group in result.get("groups", []):
+        label = group.get("displayName", "模型额度")
+        if label == "Gemini Models":
+            label = "Gemini"
+        elif label == "Claude and GPT models":
+            label = "Claude / GPT-OSS"
+        print(f"{indent}{CYAN}{label} 共享额度{RESET}")
+        buckets = group.get("buckets", [])
+        for window, title in [("5h", "5h"), ("weekly", "一周")]:
+            bucket = next((b for b in buckets if b.get("window") == window), None)
+            print(f"{indent}  {title:<4} {format_bucket(bucket)}")
 
 
 def parse_id_token(id_token: str) -> dict:
@@ -195,15 +394,15 @@ def cmd_current(args):
             matched_profile = name
             break
 
-    print(f"\n{BOLD}=== 当前活跃账号 ==={RESET}")
-    print(f"  {CYAN}邮箱:{RESET}         {BOLD}{summary['email']}{RESET}")
+    print(f"\n{BOLD}=== 当前账号 ==={RESET}")
     if matched_profile:
-        print(f"  {CYAN}配置档案别名:{RESET} {GREEN}{matched_profile}{RESET}")
+        print(f"  {GREEN}●{RESET}  {BOLD}{matched_profile}{RESET}  {summary['email']}")
     else:
-        print(f"  {CYAN}配置档案别名:{RESET} {YELLOW}(尚未保存为别名，建议运行 `agy-switch save` 保存){RESET}")
-    print(f"  {CYAN}Token 到期时间:{RESET} {summary['expiry']}")
-    print(f"  {CYAN}拥有刷新凭证:{RESET} {'是' if summary['has_refresh'] else '否'}")
-    print(f"  {CYAN}认证类型:{RESET}     {summary['auth_method']}\n")
+        print(f"  {YELLOW}●{RESET}  {summary['email']}  {DIM}(未保存别名){RESET}")
+    if not getattr(args, "no_quota", False):
+        print()
+        print_quota(fetch_quota(cur_data), "  ")
+        print()
 
 
 def cmd_list(args):
@@ -213,18 +412,31 @@ def cmd_list(args):
 
     meta = load_meta()
 
-    print(f"\n{BOLD}=== 已保存的 Gemini / Antigravity 账号列表 ==={RESET}")
+    print(f"\n{BOLD}=== 账号额度 ==={RESET}")
     if not meta:
         print(f"  {DIM}(当前尚无保存的账号档案){RESET}")
     else:
-        print(f"  {'状态':<6} {'档案别名 (Alias)':<20} {'邮箱 (Email)':<32} {'保存时间':<20}")
-        print(f"  {'-'*6} {'-'*20} {'-'*32} {'-'*20}")
+        profiles = []
         for name, info in sorted(meta.items()):
+            try:
+                data = cur_data if info.get("email") == cur_email else get_profile_payload(info.get("email"))
+            except Exception:
+                data = None
+            profiles.append((name, info, data))
+        show_quota = not getattr(args, "no_quota", False)
+        if show_quota:
+            print(f"  {DIM}正在刷新额度 · 进度条和百分比均表示剩余{RESET}", flush=True)
+            with ThreadPoolExecutor(max_workers=min(4, len(profiles))) as pool:
+                quotas = list(pool.map(fetch_quota, [p[2] for p in profiles]))
+        else:
+            quotas = [None] * len(profiles)
+        for (name, info, data), quota in zip(profiles, quotas):
             is_active = (cur_email and info.get("email") == cur_email)
-            marker = f"{GREEN}* 活跃{RESET}" if is_active else f"{DIM}  空闲{RESET}"
+            marker = f"{GREEN}● 当前{RESET}" if is_active else f"{DIM}○ 空闲{RESET}"
             email = info.get("email", "unknown")
-            saved_at = info.get("saved_at", "")[:19].replace("T", " ")
-            print(f"  {marker:<15} {BOLD}{name:<20}{RESET} {email:<32} {saved_at:<20}")
+            print(f"\n  {marker}  {BOLD}{name}{RESET}  {email}")
+            if quota is not None:
+                print_quota(quota)
 
     if cur_email and not any(info.get("email") == cur_email for info in meta.values()):
         print(f"\n{YELLOW}提示: 当前活跃账号 {cur_email} 尚未保存档案，可运行 `agy-switch save` 将其保存。{RESET}")
@@ -370,10 +582,12 @@ def main():
 
     # list
     p_list = subparsers.add_parser("list", aliases=["ls"], help="列出所有已保存账号及当前激活账号")
+    p_list.add_argument("--no-quota", action="store_true", help="仅查看本地账号信息，不联网查询额度")
     p_list.set_defaults(func=cmd_list)
 
     # current
     p_cur = subparsers.add_parser("current", aliases=["status", "whoami"], help="查看当前活跃账号详情")
+    p_cur.add_argument("--no-quota", action="store_true", help="仅查看本地账号信息，不联网查询额度")
     p_cur.set_defaults(func=cmd_current)
 
     # save
@@ -397,7 +611,9 @@ def main():
     p_rm.set_defaults(func=cmd_remove)
 
     if len(sys.argv) == 1:
-        cmd_current(None)
+        current = get_token_summary(get_current_keyring_token())
+        listed = current and any(info.get("email") == current["email"] for info in load_meta().values())
+        cmd_current(argparse.Namespace(no_quota=bool(listed)))
         cmd_list(None)
         print(f"{DIM}运行 `gemini-switch --help` 查看所有切换与管理命令。{RESET}")
         return
