@@ -47,13 +47,16 @@ Run `agy-switch` without arguments to see the current active account and the lis
 - **`agy-switch save [alias]`**
   Save the current active account as a profile (e.g., `agy-switch save work`).
 
+- **`agy-switch alias [old_alias|email] <new_alias>` (or `rename`)**
+  Set or rename an account alias. If only `<new_alias>` is provided, it updates the currently active account.
+
 - **`agy-switch add [alias]`**
-  Add a completely new Google account. It will open your browser to complete the login, and then securely save it.
+  Add a Google account. If your current active account is not yet aliased, it prompts you to save it directly. Otherwise, it triggers the browser login flow to add a new account.
 
 - **`agy-switch switch [alias|email]` (or `use`)**
   Switch to a saved account. You can use the alias you provided or the email address.
 
-- **`agy-switch remove [alias]` (or `rm`)**
+- **`agy-switch remove [alias|email]` (or `rm`)**
   Delete a saved profile from the system.
 
 ## 🔐 Security Note

@@ -27,6 +27,7 @@ agy-switch list --no-quota
 agy-switch switch 2025
 agy-switch switch 2027
 agy-switch save 别名
+agy-switch alias [旧别名或邮箱] 新别名
 agy-switch add 别名
 ```
 

@@ -293,6 +293,11 @@ def save_meta(meta: dict):
 def save_profile(name: str, email: str, data: dict):
     # 1. Save metadata (no sensitive tokens)
     meta = load_meta()
+    # Remove any existing alias for this email to prevent duplicates
+    for old_name, info in list(meta.items()):
+        if info.get("email") == email and old_name != name:
+            del meta[old_name]
+
     meta[name] = {
         "email": email,
         "saved_at": datetime.now().isoformat()
@@ -316,11 +321,13 @@ def delete_profile(name: str):
         email = meta[name]["email"]
         del meta[name]
         save_meta(meta)
-        try:
-            if keyring.get_password(PROFILE_SERVICE, email):
-                keyring.delete_password(PROFILE_SERVICE, email)
-        except keyring.errors.PasswordDeleteError:
-            pass
+        # Only delete token from keyring if no remaining profile uses this email
+        if not any(info.get("email") == email for info in meta.values()):
+            try:
+                if keyring.get_password(PROFILE_SERVICE, email):
+                    keyring.delete_password(PROFILE_SERVICE, email)
+            except keyring.errors.PasswordDeleteError:
+                pass
 
 
 def get_token_summary(data: dict):
@@ -392,11 +399,14 @@ def cmd_current(args):
     for name, info in meta.items():
         if info.get("email") == summary["email"]:
             matched_profile = name
-            break
+            if name != summary["email"]:
+                break
 
     print(f"\n{BOLD}=== 当前账号 ==={RESET}")
-    if matched_profile:
+    if matched_profile and matched_profile != summary["email"]:
         print(f"  {GREEN}●{RESET}  {BOLD}{matched_profile}{RESET}  {summary['email']}")
+    elif matched_profile:
+        print(f"  {GREEN}●{RESET}  {summary['email']}  {DIM}(默认邮箱别名){RESET}")
     else:
         print(f"  {YELLOW}●{RESET}  {summary['email']}  {DIM}(未保存别名){RESET}")
     if not getattr(args, "no_quota", False):
@@ -434,12 +444,15 @@ def cmd_list(args):
             is_active = (cur_email and info.get("email") == cur_email)
             marker = f"{GREEN}● 当前{RESET}" if is_active else f"{DIM}○ 空闲{RESET}"
             email = info.get("email", "unknown")
-            print(f"\n  {marker}  {BOLD}{name}{RESET}  {email}")
+            alias_display = f"{BOLD}{name}{RESET}" if name != email else f"{DIM}{name}{RESET} {YELLOW}(默认邮箱别名){RESET}"
+            print(f"\n  {marker}  {alias_display}  {email}")
             if quota is not None:
                 print_quota(quota)
 
-    if cur_email and not any(info.get("email") == cur_email for info in meta.values()):
-        print(f"\n{YELLOW}提示: 当前活跃账号 {cur_email} 尚未保存档案，可运行 `agy-switch save` 将其保存。{RESET}")
+    if cur_email:
+        has_custom = any(info.get("email") == cur_email and name != cur_email for name, info in meta.items())
+        if not has_custom:
+            print(f"\n{YELLOW}提示: 当前活跃账号 {cur_email} 尚未设置别名，可运行 `agy-switch alias <别名>` 或 `agy-switch save <别名>`。{RESET}")
     print()
 
 
@@ -469,12 +482,13 @@ def cmd_switch(args):
         selected_name = target
         target_email = meta[target]["email"]
     else:
-        # Match by email
+        # Match by email (prefer custom alias if multiple exist)
         for name, info in meta.items():
             if info.get("email") == target:
                 selected_name = name
                 target_email = info.get("email")
-                break
+                if name != target:
+                    break
 
     if not target_email:
         print(f"{RED}错误: 未找到名为或邮箱为 [{target}] 的账号档案。{RESET}")
@@ -511,36 +525,66 @@ def cmd_add(args):
     cur_data = get_current_keyring_token()
     cur_summary = get_token_summary(cur_data) if cur_data else None
 
-    # Step 1: Ensure current is saved
+    # Step 1: Check if current account is already logged in but unsaved
     if cur_data and cur_summary:
         cur_email = cur_summary["email"]
         meta = load_meta()
-        if not any(info.get("email") == cur_email for info in meta.values()):
-            auto_name = cur_email
-            print(f"{YELLOW}为防止当前账号凭证丢失，正在先将当前账号 [{cur_email}] 备份为档案 [{auto_name}]...{RESET}")
-            save_profile(auto_name, cur_email, cur_data)
-            print(f"{GREEN}✓ 当前账号已备份。{RESET}")
+        custom_aliases = [name for name, info in meta.items() if info.get("email") == cur_email and name != cur_email]
+        if not custom_aliases:
+            target_name = args.name or cur_email
+            print(f"\n{YELLOW}检测到当前已有活跃登录账号: [{cur_email}]{RESET}")
+            if target_name != cur_email:
+                print(f"您指定了别名: {BOLD}{target_name}{RESET}")
+            try:
+                choice = input(f"是否直接将当前账号保存为档案别名 [{BOLD}{target_name}{RESET}]？(Y/n): ").strip().lower()
+            except (KeyboardInterrupt, EOFError):
+                print("\n操作已取消。")
+                return
+            if choice in ("", "y", "yes"):
+                save_profile(target_name, cur_email, cur_data)
+                print(f"{GREEN}✓ 成功将当前账号 [{cur_email}] 保存为配置档案: {BOLD}{target_name}{RESET}")
+                return
+            else:
+                # User chose 'n' - wants to log into a different account
+                if not any(info.get("email") == cur_email for info in meta.values()):
+                    save_profile(cur_email, cur_email, cur_data)
+                    print(f"{GREEN}✓ 当前账号已临时备份为 [{cur_email}]。{RESET}")
+        else:
+            if not any(info.get("email") == cur_email for info in meta.values()):
+                save_profile(cur_email, cur_email, cur_data)
 
-    # Step 2: Clear keyring token
-    print(f"\n{CYAN}准备添加新账号:{RESET}")
-    print(f"1. 即将清空系统钥匙串中的活跃登录态（旧凭据已安全保存在本地档案中）。")
-    print(f"2. 请在弹出的浏览器中登录您的【新 Google / Gemini 账号】并授权。")
-    input(f"{BOLD}请按回车键继续...{RESET}")
+    # Step 2: Clear keyring token and launch agy for new login
+    print(f"\n{CYAN}准备添加并登录新账号:{RESET}")
+    print(f"1. 即将临时清空当前活跃登录态（旧凭据已安全保存在本地档案中）。")
+    print(f"2. 启动 agy 后，请在弹出的浏览器中登录您的【新 Google 账号】并授权。")
+    print(f"3. 登录成功后，若进入了 agy 对话界面，按 {BOLD}Ctrl+C{RESET} 退出即可完成保存。\n")
+    try:
+        input(f"{BOLD}请按回车键继续 (或 Ctrl+C 取消)...{RESET}")
+    except (KeyboardInterrupt, EOFError):
+        print("\n操作已取消。")
+        return
 
     delete_current_keyring_token()
     print(f"{YELLOW}已清除活跃登录态。正在启动 agy 触发登录流程...{RESET}\n")
 
     try:
-        # Launch agy in interactive login mode
         subprocess.run(["agy"], check=False)
+    except KeyboardInterrupt:
+        print()
     except FileNotFoundError:
         print(f"{RED}未在 PATH 中找到 agy 命令。请手动运行 agy 完成新账号登录。{RESET}")
+        if cur_data:
+            set_current_keyring_token(cur_data)
         return
 
     # Step 3: Check if new login succeeded
     new_data = get_current_keyring_token()
     if not new_data:
-        print(f"\n{RED}未检测到新登录凭证。如果尚未完成登录，可稍后运行 `agy` 登录，随后使用 `agy-switch save [别名]` 保存。{RESET}")
+        print(f"\n{RED}未检测到新登录凭证。{RESET}")
+        if cur_data:
+            set_current_keyring_token(cur_data)
+            print(f"{GREEN}✓ 已恢复之前的账号登录状态。{RESET}")
+        print(f"提示: 您可以稍后运行 `agy` 登录，随后使用 `agy-switch save [别名]` 保存。")
         return
 
     new_summary = get_token_summary(new_data)
@@ -552,17 +596,94 @@ def cmd_add(args):
     print(f"您随时可以使用 {BOLD}agy-switch switch {name}{RESET} 切换回此账号。")
 
 
+def cmd_rename(args):
+    positionals = args.names
+    meta = load_meta()
+    
+    if len(positionals) == 1:
+        new_name = positionals[0]
+        cur_data = get_current_keyring_token()
+        cur_summary = get_token_summary(cur_data) if cur_data else None
+        if not cur_summary:
+            print(f"{RED}错误: 未指定目标账号，且当前未检测到活跃账号。{RESET}")
+            print(f"用法: `agy-switch alias [账号邮箱或旧别名] <新别名>` 或 `agy-switch alias <新别名>` (针对当前账号)")
+            return
+        cur_email = cur_summary["email"]
+        selected_name = None
+        for name, info in meta.items():
+            if info.get("email") == cur_email:
+                selected_name = name
+                break
+        if not selected_name:
+            save_profile(new_name, cur_email, cur_data)
+            print(f"{GREEN}✓ 成功将当前账号 [{cur_email}] 保存为配置档案: {BOLD}{new_name}{RESET}")
+            return
+    elif len(positionals) == 2:
+        target, new_name = positionals[0], positionals[1]
+        selected_name = None
+        if target in meta:
+            selected_name = target
+        else:
+            for name, info in meta.items():
+                if info.get("email") == target:
+                    selected_name = name
+                    break
+        if not selected_name:
+            print(f"{RED}错误: 未找到名为或邮箱为 [{target}] 的账号档案。{RESET}")
+            print(f"请使用 `agy-switch list` 查看所有可用档案。")
+            return
+    else:
+        print(f"{RED}错误: 参数数量不正确。{RESET}")
+        print(f"用法: `agy-switch alias [旧别名或邮箱] <新别名>` 或针对当前账号 `agy-switch alias <新别名>`")
+        return
+
+    if selected_name == new_name:
+        print(f"{YELLOW}档案别名已经是 [{new_name}]，无需修改。{RESET}")
+        return
+
+    if new_name in meta and meta[new_name].get("email") != meta[selected_name].get("email"):
+        print(f"{RED}错误: 别名 [{new_name}] 已被其他账号 ({meta[new_name].get('email')}) 使用。{RESET}")
+        return
+
+    email = meta[selected_name]["email"]
+    info = meta.pop(selected_name)
+    info["saved_at"] = datetime.now().isoformat()
+    
+    # Remove any other duplicate entries for this email
+    for old_name, old_info in list(meta.items()):
+        if old_info.get("email") == email:
+            del meta[old_name]
+
+    meta[new_name] = info
+    save_meta(meta)
+    print(f"{GREEN}✓ 成功将账号 [{email}] 的别名修改为: {BOLD}{new_name}{RESET}")
+
+
 def cmd_remove(args):
     name = args.name
     meta = load_meta()
-    if name not in meta:
+    target_name = None
+    if name in meta:
+        target_name = name
+    else:
+        for n, info in meta.items():
+            if info.get("email") == name:
+                target_name = n
+                break
+
+    if not target_name:
         print(f"{RED}错误: 档案 [{name}] 不存在。{RESET}")
         return
 
-    confirm = input(f"确认删除账号档案 [{name}] 吗？(y/N): ").strip().lower()
+    email = meta[target_name]["email"]
+    try:
+        confirm = input(f"确认删除账号档案 [{target_name}] ({email}) 吗？(y/N): ").strip().lower()
+    except (KeyboardInterrupt, EOFError):
+        print("\n操作已取消。")
+        return
     if confirm == "y":
-        delete_profile(name)
-        print(f"{GREEN}✓ 已删除档案 [{name}]。{RESET}")
+        delete_profile(target_name)
+        print(f"{GREEN}✓ 已删除档案 [{target_name}]。{RESET}")
     else:
         print("操作已取消。")
 
@@ -595,6 +716,11 @@ def main():
     p_save.add_argument("name", nargs="?", default=None, help="配置别名 (留空默认使用邮箱)")
     p_save.set_defaults(func=cmd_save)
 
+    # alias / rename
+    p_alias = subparsers.add_parser("alias", aliases=["rename", "set-alias"], help="修改或设置账号别名")
+    p_alias.add_argument("names", nargs="+", help="[旧别名或邮箱] <新别名>，若仅提供一个参数则修改当前账号别名")
+    p_alias.set_defaults(func=cmd_rename)
+
     # switch
     p_switch = subparsers.add_parser("switch", aliases=["use"], help="切换到指定账号档案 (按别名或邮箱)")
     p_switch.add_argument("target", help="目标档案别名或邮箱")
@@ -607,15 +733,15 @@ def main():
 
     # remove
     p_rm = subparsers.add_parser("remove", aliases=["rm"], help="删除指定的账号档案")
-    p_rm.add_argument("name", help="要删除的档案别名")
+    p_rm.add_argument("name", help="要删除的档案别名或邮箱")
     p_rm.set_defaults(func=cmd_remove)
 
     if len(sys.argv) == 1:
         current = get_token_summary(get_current_keyring_token())
         listed = current and any(info.get("email") == current["email"] for info in load_meta().values())
         cmd_current(argparse.Namespace(no_quota=bool(listed)))
-        cmd_list(None)
-        print(f"{DIM}运行 `gemini-switch --help` 查看所有切换与管理命令。{RESET}")
+        cmd_list(argparse.Namespace(no_quota=False))
+        print(f"{DIM}运行 `agy-switch --help` 查看所有切换与管理命令。{RESET}")
         return
 
     args = parser.parse_args()
