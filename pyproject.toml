@@ -23,3 +23,6 @@ dependencies = [
 [project.scripts]
 agy-switch = "agy_switch:main"
 gemini-switch = "agy_switch:main"
+
+[tool.setuptools]
+py-modules = ["agy_switch", "agy_switch_local"]
