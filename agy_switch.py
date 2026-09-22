@@ -273,6 +273,71 @@ def delete_current_keyring_token():
         pass
 
 
+def find_running_agy_processes():
+    """Return agy PIDs that may still hold and refresh an old login.
+
+    Antigravity keeps the OAuth token in memory and periodically persists a
+    refreshed copy. Replacing the credential while an older CLI is alive is
+    therefore unsafe: the old process can later restore its own account.
+    """
+    current_pid = os.getpid()
+    processes = []
+
+    proc_root = Path("/proc")
+    if proc_root.is_dir():
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid == current_pid:
+                continue
+            try:
+                name = (entry / "comm").read_text(encoding="utf-8").strip()
+            except (OSError, UnicodeError):
+                continue
+            if name in ("agy", "agy.exe"):
+                processes.append(pid)
+        return sorted(processes)
+
+    if os.name == "posix":
+        try:
+            result = subprocess.run(
+                ["pgrep", "-x", "agy"], capture_output=True, text=True,
+                check=False,
+            )
+            processes.extend(
+                int(line) for line in result.stdout.splitlines()
+                if line.strip().isdigit() and int(line) != current_pid
+            )
+        except (FileNotFoundError, OSError):
+            pass
+    elif os.name == "nt":
+        try:
+            result = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq agy.exe", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, check=False,
+            )
+            for line in result.stdout.splitlines():
+                match = re.match(r'^"agy\.exe","(\d+)"', line.strip(), re.I)
+                if match and int(match.group(1)) != current_pid:
+                    processes.append(int(match.group(1)))
+        except (FileNotFoundError, OSError):
+            pass
+    return sorted(set(processes))
+
+
+def require_agy_stopped(action):
+    """Refuse credential mutations while agy can overwrite them again."""
+    processes = find_running_agy_processes()
+    if not processes:
+        return True
+    pids = ", ".join(str(pid) for pid in processes)
+    print(f"{RED}无法{action}: 检测到正在运行的 agy 进程 (PID: {pids})。{RESET}")
+    print("每个 agy 会缓存启动时的账号，并在刷新登录时重新写入全局凭据；此时切换会被旧账号覆盖。")
+    print(f"请先在所有 agy 窗口中按 {BOLD}Ctrl+C{RESET} 退出，确认进程已结束后再重试。")
+    return False
+
+
 def load_meta() -> dict:
     if not META_FILE.exists():
         return {}
@@ -402,13 +467,17 @@ def cmd_current(args):
             if name != summary["email"]:
                 break
 
-    print(f"\n{BOLD}=== 当前账号 ==={RESET}")
+    print(f"\n{BOLD}=== 当前凭据账号（新启动的 agy） ==={RESET}")
     if matched_profile and matched_profile != summary["email"]:
         print(f"  {GREEN}●{RESET}  {BOLD}{matched_profile}{RESET}  {summary['email']}")
     elif matched_profile:
         print(f"  {GREEN}●{RESET}  {summary['email']}  {DIM}(默认邮箱别名){RESET}")
     else:
         print(f"  {YELLOW}●{RESET}  {summary['email']}  {DIM}(未保存别名){RESET}")
+    running = find_running_agy_processes()
+    if running:
+        pids = ", ".join(str(pid) for pid in running)
+        print(f"  {YELLOW}⚠ 已运行的 agy 不会随凭据切换，且可能在刷新时覆盖它 (PID: {pids}){RESET}")
     if not getattr(args, "no_quota", False):
         print()
         print_quota(fetch_quota(cur_data), "  ")
@@ -501,9 +570,22 @@ def cmd_switch(args):
         print(f"{RED}错误: 无法在密钥环中读取到账号 [{target_email}] 的凭据。可能是被手动删除或未成功迁移。{RESET}")
         return
 
+    payload_summary = get_token_summary(payload)
+    if not payload_summary or payload_summary["email"] != target_email:
+        actual_email = payload_summary["email"] if payload_summary else "未知邮箱"
+        print(f"{RED}错误: 档案 [{selected_name}] 的凭据属于 [{actual_email}]，与元数据 [{target_email}] 不一致。{RESET}")
+        print("为避免切换到错误账号，操作已取消；请重新登录该账号并保存档案。")
+        return
+
     # Check if already active
     cur_data = get_current_keyring_token()
     cur_summary = get_token_summary(cur_data) if cur_data else None
+
+    # Even when the credential file already names the target, an older agy can
+    # still be using another in-memory account and overwrite the file later.
+    if not require_agy_stopped("切换账号"):
+        return
+
     if cur_summary and cur_summary["email"] == target_email:
         print(f"{YELLOW}提示: 当前已经在使用账号 [{target_email}] (档案: {selected_name})。{RESET}")
         return
@@ -517,11 +599,19 @@ def cmd_switch(args):
 
     print(f"正在切换到账号: {BOLD}{target_email}{RESET} (档案: {selected_name})...")
     set_current_keyring_token(payload)
+    written = get_token_summary(get_current_keyring_token())
+    if not written or written["email"] != target_email:
+        actual_email = written["email"] if written else "未检测到凭据"
+        print(f"{RED}错误: 写入后校验失败，当前凭据为 [{actual_email}]，并非目标账号。{RESET}")
+        return
     print(f"{GREEN}✓ 成功切换到账号 [{target_email}]！{RESET}")
     print(f"{DIM}提示: 下次启动 `agy` 或开启新任务时将自动使用此账号。若 IDE 正在运行，重载窗口即可生效。{RESET}")
 
 
 def cmd_add(args):
+    if not require_agy_stopped("添加账号"):
+        return
+
     cur_data = get_current_keyring_token()
     cur_summary = get_token_summary(cur_data) if cur_data else None
 

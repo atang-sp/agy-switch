@@ -55,9 +55,15 @@ Run `agy-switch` without arguments to see the current active account and the lis
 
 - **`agy-switch switch [alias|email]` (or `use`)**
   Switch to a saved account. You can use the alias you provided or the email address.
+  All running `agy` sessions must be exited first. An existing session keeps its
+  startup account in memory and can overwrite the shared credential when its
+  access token refreshes, so the switcher refuses unsafe live switching.
 
 - **`agy-switch remove [alias|email]` (or `rm`)**
   Delete a saved profile from the system.
+
+`agy-switch current` reports the credential that a newly started `agy` process
+will use. Already-running sessions keep the account with which they started.
 
 ## 🔐 Security Note
 All tokens (including sensitive refresh tokens) are securely stored in your OS's native Keyring system under the service name `gemini` and `gemini-accounts`. Only non-sensitive metadata (aliases and emails) are stored in `~/.gemini/accounts_meta.json`.
