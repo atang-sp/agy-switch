@@ -102,6 +102,30 @@ class ProjectTests(unittest.TestCase):
         self.assertIn("当前项目账号", output.getvalue())
         self.assertIn("work", output.getvalue())
 
+    def test_list_shows_bound_and_running_projects_per_account(self):
+        profiles = {
+            "work": {"email": "a@example.com"},
+            "personal": {"email": "b@example.com"},
+        }
+        output = io.StringIO()
+        with patch.object(app, "supports_project_accounts", return_value=True), \
+             patch.object(app, "project_account", return_value="a@example.com"), \
+             patch.object(app, "load_meta", return_value=profiles), \
+             patch.object(app, "load_projects", return_value={
+                 "/project/a": "a@example.com", "/project/b": "b@example.com",
+             }), \
+             patch.object(app, "running_project_sessions", return_value={
+                 "a@example.com": {"/project/a": 2},
+             }), \
+             patch.object(app, "get_profile_payload", side_effect=lambda email: token(email)), \
+             patch("sys.stdout", output):
+            app.cmd_list(argparse.Namespace(no_quota=True))
+        text = output.getvalue()
+        self.assertIn("● 本目录", text)
+        self.assertIn("/project/a  · 运行中 2 个 agy", text)
+        self.assertIn("/project/b  · 已绑定，未运行", text)
+        self.assertNotIn("空闲", text)
+
     def test_switch_binds_current_project_without_changing_global_login(self):
         with tempfile.TemporaryDirectory() as temp:
             projects_file = Path(temp) / "projects.json"

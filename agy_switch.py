@@ -430,6 +430,28 @@ def project_home(root, email):
     return PROJECT_HOMES_DIR / digest
 
 
+def running_project_sessions(emails):
+    """Count agy processes using each project's isolated credential home."""
+    if not supports_project_accounts() or not Path("/proc").is_dir():
+        return {}
+    sessions = {}
+    for pid in find_running_agy_processes():
+        proc = Path("/proc") / str(pid)
+        try:
+            environment = (proc / "environ").read_bytes().split(b"\0")
+            home = next((entry[5:].decode("utf-8") for entry in environment
+                         if entry.startswith(b"HOME=")), None)
+            root = project_root((proc / "cwd").resolve(strict=True))
+        except (OSError, UnicodeError, ValueError):
+            continue
+        for email in emails:
+            if home == str(project_home(root, email)):
+                sessions.setdefault(email, {}).setdefault(root, 0)
+                sessions[email][root] += 1
+                break
+    return sessions
+
+
 def prepare_project_home(root, email, payload):
     """Keep agy's token and mutable state private to this project/account pair."""
     home = project_home(root, email)
@@ -638,6 +660,8 @@ def cmd_list(args):
     cur_email = cur_summary["email"] if cur_summary else None
 
     meta = load_meta()
+    projects = load_projects() if supports_project_accounts() else {}
+    sessions = running_project_sessions({info.get("email") for info in meta.values() if info.get("email")})
 
     print(f"\n{BOLD}=== 账号额度 ==={RESET}")
     if not meta:
@@ -659,10 +683,22 @@ def cmd_list(args):
             quotas = [None] * len(profiles)
         for (name, info, data), quota in zip(profiles, quotas):
             is_active = (cur_email and info.get("email") == cur_email)
-            marker = f"{GREEN}● 当前{RESET}" if is_active else f"{DIM}○ 空闲{RESET}"
+            current_label = "本目录" if project_email else "全局默认"
+            marker = f"{GREEN}● {current_label}{RESET}" if is_active else f"{DIM}○{RESET}"
             email = info.get("email", "unknown")
             alias_display = f"{BOLD}{name}{RESET}" if name != email else f"{DIM}{name}{RESET} {YELLOW}(默认邮箱别名){RESET}"
             print(f"\n  {marker}  {alias_display}  {email}")
+            if supports_project_accounts():
+                bound_roots = sorted(root for root, bound_email in projects.items() if bound_email == email)
+                running = sessions.get(email, {})
+                if not bound_roots and not running:
+                    print(f"    {DIM}项目: 未绑定{RESET}")
+                for root in bound_roots:
+                    count = running.get(root, 0)
+                    status = f"运行中 {count} 个 agy" if count else "已绑定，未运行"
+                    print(f"    项目: {root}  · {status}")
+                for root in sorted(set(running) - set(bound_roots)):
+                    print(f"    项目: {root}  · 运行中 {running[root]} 个 agy（当前绑定已变更）")
             if quota is not None:
                 print_quota(quota)
 

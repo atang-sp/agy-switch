@@ -38,7 +38,8 @@ Run `agy-switch` without arguments to see the current active account and the lis
 ### Commands
 
 - **`agy-switch list` (or `ls`)**
-  List saved account aliases and live quota information. The compact view shows only each account's email, 5-hour quota, weekly quota, and reset countdown.
+  List saved accounts, project bindings, running project sessions, and live quota information.
+  The current marker identifies the account selected for a new `agy` in this directory.
 
 - **`agy-switch current` (or `status`, `whoami`)**
   View the current account and its live quotas.

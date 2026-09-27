@@ -45,6 +45,8 @@ Git 仓库内的子目录共用一个绑定；非 Git 目录按当前目录绑�
 `agy-switch current` 显示本目录的账号；`agy-switch switch --default`
 取消项目绑定，恢复使用全局账号。`agy-switch switch --global <别名>`
 仅在需要修改全局默认账号时使用。
+`agy-switch list --no-quota` 会在每个账号下显示绑定的项目，以及对应项目中
+正在运行的 `agy` 数量；“本目录”表示从当前目录新启动时会选中的账号。
 项目绑定保存在 `~/.gemini/agy-switch/projects.json`，每个项目和账号组合的
 登录文件保存在 `~/.gemini/agy-switch/project-homes/` 下，权限限制为当前用户。
 项目绑定不修改全局登录文件，因此不同项目可以同时运行不同账号。
