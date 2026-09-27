@@ -16,6 +16,16 @@ def token(email):
 
 
 class ProjectTests(unittest.TestCase):
+    def test_agy_binary_resolves_local_launcher_to_real_executable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            launcher = Path(temp) / "agy"
+            real = Path(temp) / "agy-real"
+            launcher.write_text("#!/bin/sh\n", encoding="utf-8")
+            real.write_bytes(b"binary")
+            real.chmod(0o755)
+            with patch.dict(app.os.environ, {"AGY_BIN": str(launcher)}):
+                self.assertEqual(app.agy_binary(), str(real))
+
     def test_git_subdirectories_share_project_root(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "repo"

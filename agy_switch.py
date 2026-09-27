@@ -58,6 +58,17 @@ class QuotaError(Exception):
     pass
 
 
+def agy_binary():
+    """Find the actual agy binary when a local project launcher is installed."""
+    binary = os.environ.get("AGY_BIN") or shutil.which("agy")
+    if binary:
+        path = Path(binary)
+        real = path.with_name("agy-real")
+        if path.name == "agy" and real.is_file() and os.access(real, os.X_OK):
+            return str(real)
+    return binary
+
+
 def oauth_clients():
     """Discover agy's installed OAuth client without storing it in source control."""
     global _OAUTH_CLIENTS
@@ -70,7 +81,7 @@ def oauth_clients():
     if env_id and env_secret:
         candidates.append((env_id, env_secret))
 
-    binary = os.environ.get("AGY_BIN") or shutil.which("agy")
+    binary = agy_binary()
     if binary:
         try:
             content = Path(binary).read_bytes()
@@ -300,20 +311,21 @@ def find_running_agy_processes():
                 name = (entry / "comm").read_text(encoding="utf-8").strip()
             except (OSError, UnicodeError):
                 continue
-            if name in ("agy", "agy.exe"):
+            if name in ("agy", "agy-real", "agy.exe"):
                 processes.append(pid)
         return sorted(processes)
 
     if os.name == "posix":
         try:
-            result = subprocess.run(
-                ["pgrep", "-x", "agy"], capture_output=True, text=True,
-                check=False,
-            )
-            processes.extend(
-                int(line) for line in result.stdout.splitlines()
-                if line.strip().isdigit() and int(line) != current_pid
-            )
+            for name in ("agy", "agy-real"):
+                result = subprocess.run(
+                    ["pgrep", "-x", name], capture_output=True, text=True,
+                    check=False,
+                )
+                processes.extend(
+                    int(line) for line in result.stdout.splitlines()
+                    if line.strip().isdigit() and int(line) != current_pid
+                )
         except (FileNotFoundError, OSError):
             pass
     elif os.name == "nt":
@@ -462,7 +474,7 @@ def prepare_project_home(root, email, payload):
 
 
 def cmd_run_agy(agy_args):
-    binary = os.environ.get("AGY_BIN") or shutil.which("agy")
+    binary = agy_binary()
     if not binary:
         print(f"{RED}错误: 未在 PATH 中找到 agy。{RESET}")
         return
@@ -817,7 +829,7 @@ def cmd_add(args):
     print(f"{YELLOW}已清除活跃登录态。正在启动 agy 触发登录流程...{RESET}\n")
 
     try:
-        subprocess.run(["agy"], check=False)
+        subprocess.run([agy_binary() or "agy"], check=False)
     except KeyboardInterrupt:
         print()
     except FileNotFoundError:

@@ -92,6 +92,17 @@ machine, add this function to `~/.bashrc` so `agy` reads the project binding:
 agy() { agy-switch --launch-agy "$@"; }
 ```
 
+For Fish, create `~/.config/fish/functions/agy.fish` with:
+
+```fish
+function agy
+    agy-switch --launch-agy $argv
+end
+```
+
+Check `type agy` in the shell where you launch it: it should show the function.
+Restart any `agy` sessions that were opened before installing the function.
+
 This project isolation currently supports the local WSL file credential adapter
 described in [LOCAL_SETUP.md](LOCAL_SETUP.md). It does not change the account of
 the Antigravity IDE or installations that use an OS keyring for active credentials.
