@@ -29,12 +29,34 @@ agy-switch switch 2027
 agy-switch save 别名
 agy-switch alias [旧别名或邮箱] 新别名
 agy-switch add 别名
+agy-switch switch --default
+agy-switch switch --global 2027
 ```
 
-`add` 需要在终端交互登录。切换或添加前必须先退出所有正在运行的 agy；
+`add` 需要在终端交互登录。切换全局账号或添加账号前必须先退出所有正在运行的 agy；
 旧进程会缓存启动账号，并在每小时刷新 token 时把全局凭据覆盖回旧账号。
 工具现在会检测这种情况并拒绝不安全的切换。切换成功后再重新启动 agy。
 本地适配范围是这台 WSL 的 agy CLI，不代表 Windows IDE 同步切换。
+
+## 按项目使用不同账号
+
+在各项目目录分别运行 `agy-switch switch <别名>`，随后直接运行 `agy`。
+Git 仓库内的子目录共用一个绑定；非 Git 目录按当前目录绑定。
+`agy-switch current` 显示本目录的账号；`agy-switch switch --default`
+取消项目绑定，恢复使用全局账号。`agy-switch switch --global <别名>`
+仅在需要修改全局默认账号时使用。
+项目绑定保存在 `~/.gemini/agy-switch/projects.json`，每个项目和账号组合的
+登录文件保存在 `~/.gemini/agy-switch/project-homes/` 下，权限限制为当前用户。
+项目绑定不修改全局登录文件，因此不同项目可以同时运行不同账号。
+本机 `~/.bashrc` 已配置 `agy` 包装函数，新的交互式 Bash 终端会自动使用
+项目绑定：
+
+```bash
+agy() { /home/atang/.local/bin/agy-switch --launch-agy "$@"; }
+```
+
+项目启动时 `HOME` 指向项目独立目录。原 HOME 的其他顶层条目会以符号链接
+保留，`.gemini` 登录状态则独立；`~` 本身会指向项目目录。
 
 默认列表会分别显示 Gemini 和 Claude/GPT-OSS 共享池的 5 小时、每周剩余额度（同时显示已用比例），
 以及各自的本地重置时间和倒计时。`current` 同样显示当前账号额度。

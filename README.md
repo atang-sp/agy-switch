@@ -6,9 +6,10 @@ This tool allows you to easily seamlessly switch between multiple Google account
 
 ## 🌟 Features
 - **Fast Switching**: Jump between Personal, Work, or Test accounts instantly.
+- **Project accounts on WSL**: Use `switch` inside a project, then start `agy` normally. Different projects can run with different accounts at the same time.
 - **Per-account Quotas**: See separate 5-hour and weekly remaining percentages and reset times for every account.
-- **Secure**: Uses your operating system's native secure credential store (Linux Secret Service, macOS Keychain, Windows Credential Locker) via the `keyring` library. No tokens are stored in plain text.
-- **Cross-Platform**: Works flawlessly on Linux, macOS, and Windows.
+- **Credential storage**: Standard installs use the OS keyring. The WSL file adapter keeps credentials in owner-only files.
+- **Cross-Platform**: Account management supports Linux, macOS, and Windows; project isolation currently supports the WSL file adapter.
 - **Auto-migration**: If you were using an older version, it will automatically and securely migrate your plain-text tokens into the secure keyring.
 
 ## 🛠 Installation
@@ -54,19 +55,55 @@ Run `agy-switch` without arguments to see the current active account and the lis
   Add a Google account. If your current active account is not yet aliased, it prompts you to save it directly. Otherwise, it triggers the browser login flow to add a new account.
 
 - **`agy-switch switch [alias|email]` (or `use`)**
-  Switch to a saved account. You can use the alias you provided or the email address.
-  All running `agy` sessions must be exited first. An existing session keeps its
-  startup account in memory and can overwrite the shared credential when its
-  access token refreshes, so the switcher refuses unsafe live switching.
+  On the WSL file credential setup, assign a saved account to the current Git
+  project (or current directory outside Git). Use `--global` to switch the
+  shared default account and `--default` to clear the current project binding.
+  Global switching requires all running `agy` sessions to exit first.
 
 - **`agy-switch remove [alias|email]` (or `rm`)**
   Delete a saved profile from the system.
 
-`agy-switch current` reports the credential that a newly started `agy` process
-will use. Already-running sessions keep the account with which they started.
+### Different accounts for different projects (WSL file credential setup)
+
+First save each account with `agy-switch add` or `agy-switch save`. Then run:
+
+```bash
+cd /path/to/work-project
+agy-switch switch work
+agy
+
+cd /path/to/personal-project
+agy-switch switch personal
+agy
+```
+
+`switch` accepts a saved alias or email. It binds the Git worktree root, so
+commands from its subdirectories use the same account. Outside Git, the current
+directory is the project. `agy-switch current` shows the selected account.
+Run `agy-switch switch --default` to clear a project binding.
+
+The local shell integration gives each project/account pair its own `HOME` and
+`~/.gemini/antigravity-cli/antigravity-oauth-token`. Other entries in your home
+directory are linked into this isolated home so common tool configuration remains
+available. The global active account is unchanged. If installing on another WSL
+machine, add this function to `~/.bashrc` so `agy` reads the project binding:
+
+```bash
+agy() { agy-switch --launch-agy "$@"; }
+```
+
+This project isolation currently supports the local WSL file credential adapter
+described in [LOCAL_SETUP.md](LOCAL_SETUP.md). It does not change the account of
+the Antigravity IDE or installations that use an OS keyring for active credentials.
+
+Already-running sessions keep the account with which they started.
 
 ## 🔐 Security Note
-All tokens (including sensitive refresh tokens) are securely stored in your OS's native Keyring system under the service name `gemini` and `gemini-accounts`. Only non-sensitive metadata (aliases and emails) are stored in `~/.gemini/accounts_meta.json`.
+Standard installations store tokens (including refresh tokens) in the OS keyring
+under `gemini` and `gemini-accounts`. The WSL file credential adapter stores
+them in owner-only files, including project credentials; see
+[LOCAL_SETUP.md](LOCAL_SETUP.md). Account aliases, emails, and project bindings
+are stored separately as metadata.
 
 ## Quota details
 

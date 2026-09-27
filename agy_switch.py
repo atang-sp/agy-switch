@@ -13,6 +13,8 @@ import subprocess
 import math
 import re
 import shutil
+import hashlib
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +33,8 @@ PROFILE_SERVICE = "gemini-accounts"
 CONFIG_DIR = Path.home() / ".gemini"
 OLD_ACCOUNTS_DIR = CONFIG_DIR / "accounts"
 META_FILE = CONFIG_DIR / "accounts_meta.json"
+PROJECTS_FILE = CONFIG_DIR / "agy-switch" / "projects.json"
+PROJECT_HOMES_DIR = CONFIG_DIR / "agy-switch" / "project-homes"
 
 # ANSI Colors
 GREEN = "\033[92m"
@@ -47,6 +51,7 @@ RESET = "\033[0m"
 QUOTA_URL = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary"
 OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
 _OAUTH_CLIENTS = None
+LOCAL_FILE_BACKEND = False
 
 
 class QuotaError(Exception):
@@ -355,6 +360,126 @@ def save_meta(meta: dict):
     os.chmod(META_FILE, 0o600)
 
 
+def project_root(path=None):
+    """Use the Git worktree root so subdirectories share one account binding."""
+    directory = Path(path or os.getcwd()).expanduser().resolve()
+    if not directory.is_dir():
+        raise ValueError(f"项目目录不存在: {directory}")
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(directory), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        return str(directory)
+    if result.returncode == 0 and result.stdout.strip():
+        return str(Path(result.stdout.strip()).resolve())
+    return str(directory)
+
+
+def load_projects():
+    if not PROJECTS_FILE.exists():
+        return {}
+    with open(PROJECTS_FILE, "r", encoding="utf-8") as stream:
+        projects = json.load(stream)
+    if not isinstance(projects, dict):
+        raise ValueError("项目绑定文件格式错误")
+    return projects
+
+
+def save_projects(projects):
+    PROJECTS_FILE.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    PROJECTS_FILE.parent.chmod(0o700)
+    fd, temp = tempfile.mkstemp(prefix=".projects-", dir=PROJECTS_FILE.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(projects, stream, indent=2, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, PROJECTS_FILE)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def supports_project_accounts():
+    return LOCAL_FILE_BACKEND
+
+
+def project_account():
+    """Return the account bound to the current directory, if any."""
+    if not supports_project_accounts():
+        return None
+    return load_projects().get(project_root())
+
+
+def project_home(root, email):
+    digest = hashlib.sha256((root + "\0" + email).encode("utf-8")).hexdigest()
+    return PROJECT_HOMES_DIR / digest
+
+
+def prepare_project_home(root, email, payload):
+    """Keep agy's token and mutable state private to this project/account pair."""
+    home = project_home(root, email)
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    PROJECT_HOMES_DIR.chmod(0o700)
+    home.chmod(0o700)
+    real_home = Path.home()
+    # Preserve common user configuration for tools launched by agy. The .gemini
+    # tree remains private, so a refreshed token cannot overwrite global login.
+    for item in real_home.iterdir():
+        link = home / item.name
+        if item.name != ".gemini" and not link.exists() and not link.is_symlink():
+            link.symlink_to(item, target_is_directory=item.is_dir())
+    gemini_dir = home / ".gemini"
+    auth_dir = gemini_dir / "antigravity-cli"
+    auth_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for source, target in (
+        (real_home / ".gemini" / "config", gemini_dir / "config"),
+        (real_home / ".gemini" / "antigravity-cli" / "settings.json", auth_dir / "settings.json"),
+    ):
+        if source.exists() and not target.exists() and not target.is_symlink():
+            target.symlink_to(source, target_is_directory=source.is_dir())
+    token_file = auth_dir / "antigravity-oauth-token"
+    try:
+        existing = json.loads(token_file.read_text(encoding="utf-8"))
+        current = get_token_summary(existing)
+        if current and current["email"] == email:
+            return home
+    except (FileNotFoundError, ValueError, OSError):
+        pass
+    fd, temp = tempfile.mkstemp(prefix=".credential-", dir=auth_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, token_file)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+    return home
+
+
+def cmd_run_agy(agy_args):
+    binary = os.environ.get("AGY_BIN") or shutil.which("agy")
+    if not binary:
+        print(f"{RED}错误: 未在 PATH 中找到 agy。{RESET}")
+        return
+    env = os.environ.copy()
+    email = project_account()
+    if email:
+        root = project_root()
+        payload = get_profile_payload(email)
+        summary = get_token_summary(payload) if payload else None
+        if not summary or summary["email"] != email:
+            print(f"{RED}错误: 项目账号 [{email}] 的档案凭据缺失或邮箱不匹配。{RESET}")
+            return
+        env["HOME"] = str(prepare_project_home(root, email, payload))
+        print(f"{GREEN}项目账号: {email}{RESET}", flush=True)
+    os.execvpe(binary, [binary] + agy_args, env)
+
+
 def save_profile(name: str, email: str, data: dict):
     # 1. Save metadata (no sensitive tokens)
     meta = load_meta()
@@ -451,10 +576,14 @@ def migrate_old_accounts():
 
 
 def cmd_current(args):
-    cur_data = get_current_keyring_token()
+    project_email = project_account()
+    cur_data = get_profile_payload(project_email) if project_email else get_current_keyring_token()
     if not cur_data:
-        print(f"{YELLOW}当前未检测到任何已登录的 Antigravity / Gemini 账号。{RESET}")
-        print(f"请运行 {BOLD}agy{RESET} 进行初次登录。")
+        if project_email:
+            print(f"{RED}项目绑定的账号 [{project_email}] 已没有可用档案，请重新保存该账号。{RESET}")
+        else:
+            print(f"{YELLOW}当前未检测到任何已登录的 Antigravity / Gemini 账号。{RESET}")
+            print(f"请运行 {BOLD}agy{RESET} 进行初次登录。")
         return
 
     summary = get_token_summary(cur_data)
@@ -467,14 +596,20 @@ def cmd_current(args):
             if name != summary["email"]:
                 break
 
-    print(f"\n{BOLD}=== 当前凭据账号（新启动的 agy） ==={RESET}")
+    if project_email and summary["email"] != project_email:
+        print(f"{RED}错误: 项目绑定账号与档案凭据不匹配。{RESET}")
+        return
+    title = "当前项目账号" if project_email else "当前全局凭据账号"
+    print(f"\n{BOLD}=== {title}（新启动的 agy） ==={RESET}")
+    if project_email:
+        print(f"  {DIM}项目: {project_root()}{RESET}")
     if matched_profile and matched_profile != summary["email"]:
         print(f"  {GREEN}●{RESET}  {BOLD}{matched_profile}{RESET}  {summary['email']}")
     elif matched_profile:
         print(f"  {GREEN}●{RESET}  {summary['email']}  {DIM}(默认邮箱别名){RESET}")
     else:
         print(f"  {YELLOW}●{RESET}  {summary['email']}  {DIM}(未保存别名){RESET}")
-    running = find_running_agy_processes()
+    running = find_running_agy_processes() if not project_email else []
     if running:
         pids = ", ".join(str(pid) for pid in running)
         print(f"  {YELLOW}⚠ 已运行的 agy 不会随凭据切换，且可能在刷新时覆盖它 (PID: {pids}){RESET}")
@@ -485,7 +620,8 @@ def cmd_current(args):
 
 
 def cmd_list(args):
-    cur_data = get_current_keyring_token()
+    project_email = project_account()
+    cur_data = get_profile_payload(project_email) if project_email else get_current_keyring_token()
     cur_summary = get_token_summary(cur_data) if cur_data else None
     cur_email = cur_summary["email"] if cur_summary else None
 
@@ -540,7 +676,21 @@ def cmd_save(args):
 
 
 def cmd_switch(args):
+    if getattr(args, "default", False):
+        if args.target:
+            print(f"{RED}错误: `switch --default` 不需要账号参数。{RESET}")
+            return
+        root = project_root()
+        projects = load_projects()
+        if root in projects:
+            del projects[root]
+            save_projects(projects)
+        print(f"{GREEN}✓ 项目 {root} 将使用全局默认账号。{RESET}")
+        return
     target = args.target
+    if not target:
+        print(f"{RED}错误: 请指定账号别名或邮箱。{RESET}")
+        return
     meta = load_meta()
 
     selected_name = None
@@ -575,6 +725,15 @@ def cmd_switch(args):
         actual_email = payload_summary["email"] if payload_summary else "未知邮箱"
         print(f"{RED}错误: 档案 [{selected_name}] 的凭据属于 [{actual_email}]，与元数据 [{target_email}] 不一致。{RESET}")
         print("为避免切换到错误账号，操作已取消；请重新登录该账号并保存档案。")
+        return
+
+    if supports_project_accounts() and not getattr(args, "global_switch", False):
+        root = project_root()
+        projects = load_projects()
+        projects[root] = target_email
+        save_projects(projects)
+        print(f"{GREEN}✓ 项目 {root} 已设置为 [{selected_name}] ({target_email})。{RESET}")
+        print("在该目录直接运行 `agy` 即可使用此账号。")
         return
 
     # Check if already active
@@ -779,6 +938,12 @@ def cmd_remove(args):
 
 
 def main():
+    # The interactive shell's `agy` function forwards here. Keep agy flags
+    # untouched, including flags unknown to this account manager.
+    if len(sys.argv) > 1 and sys.argv[1] == "--launch-agy":
+        cmd_run_agy(sys.argv[2:])
+        return
+
     # Attempt migration if needed
     try:
         migrate_old_accounts()
@@ -812,8 +977,11 @@ def main():
     p_alias.set_defaults(func=cmd_rename)
 
     # switch
-    p_switch = subparsers.add_parser("switch", aliases=["use"], help="切换到指定账号档案 (按别名或邮箱)")
-    p_switch.add_argument("target", help="目标档案别名或邮箱")
+    p_switch = subparsers.add_parser("switch", aliases=["use"], help="为当前目录设置账号 (按别名或邮箱)")
+    p_switch.add_argument("target", nargs="?", help="目标档案别名或邮箱")
+    switch_options = p_switch.add_mutually_exclusive_group()
+    switch_options.add_argument("--global", dest="global_switch", action="store_true", help="切换全局默认账号")
+    switch_options.add_argument("--default", action="store_true", help="清除当前项目绑定，改用全局账号")
     p_switch.set_defaults(func=cmd_switch)
 
     # add
@@ -827,7 +995,9 @@ def main():
     p_rm.set_defaults(func=cmd_remove)
 
     if len(sys.argv) == 1:
-        current = get_token_summary(get_current_keyring_token())
+        email = project_account()
+        current_data = get_profile_payload(email) if email else get_current_keyring_token()
+        current = get_token_summary(current_data)
         listed = current and any(info.get("email") == current["email"] for info in load_meta().values())
         cmd_current(argparse.Namespace(no_quota=bool(listed)))
         cmd_list(argparse.Namespace(no_quota=False))

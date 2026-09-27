@@ -55,8 +55,9 @@ class AgyFileBackend(KeyringBackend):
 
 def main():
     keyring.set_keyring(AgyFileBackend())
-    from agy_switch import main as upstream_main
-    upstream_main()
+    import agy_switch
+    agy_switch.LOCAL_FILE_BACKEND = True
+    agy_switch.main()
 
 
 if __name__ == "__main__":
