@@ -5,22 +5,17 @@
 源码位于 `/home/atang/agy-switch`，依赖安装在 `.venv`。
 `~/.local/bin/agy-switch` 和 `gemini-switch` 通过 `agy_switch_local.py` 启动上游程序。
 
-## WSL 兼容配置
+## 自适应运行环境配置 (Linux / WSL)
 
-本机没有 Secret Service，现有 agy 使用
-`~/.gemini/antigravity-cli/antigravity-oauth-token`。
-本地适配器让新版账号管理器读写这一文件，确保切换对现有 agy 生效。
-`agy_switch.py` 已增加逐账号实时额度查询。
-
-账号档案存在 `~/.gemini/agy-switch/credentials/`，元数据存在
-`~/.gemini/accounts_meta.json`。凭据文件权限为 600，档案目录权限为 700。
-此配置使用本地明文文件，并非 README 所述的加密系统密钥环。
-
-已迁移旧账号 2025、2027，并用当前凭据更新对应档案；安装期间当前登录文件保持原样。
+`agy-switch` 现已内置自适应环境探测（`AdaptiveKeyring`）：
+- **标准 Linux / 现代 WSL2（D-Bus 正常）**：自动接入系统 SecretService 密钥环，并同步本地备份。
+- **无头 Linux / 传统 WSL**：自动无缝降级为本地受保护凭据文件（`0600` 权限）。
+- 账号档案库统一保存在 `~/.gemini/agy-switch/credentials/`，元数据保存在 `~/.gemini/accounts_meta.json`。
 
 ## 命令
 
 ```sh
+agy-switch doctor
 agy-switch list
 agy-switch current
 agy-switch list --no-quota

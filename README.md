@@ -64,6 +64,9 @@ Run `agy-switch` without arguments to see the current active account and the lis
 - **`agy-switch remove [alias|email]` (or `rm`)**
   Delete a saved profile from the system.
 
+- **`agy-switch doctor`**
+  Diagnose the current runtime environment, OS, WSL state, D-Bus session, credential storage backends, and active sessions.
+
 ### Different accounts for different projects (WSL file credential setup)
 
 First save each account with `agy-switch add` or `agy-switch save`. Then run:

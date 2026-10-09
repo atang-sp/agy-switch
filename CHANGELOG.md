@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.0 - 2026-10-09
+
+- **Adaptive Keyring Backend**: Auto-detect Linux D-Bus session and bridge SecretService keyring with owner-only local file storage. Transparent fallback on headless or legacy WSL environments.
+- **Robust OAuth Email Resolution**: Automatically fetch user email via Google OAuth tokeninfo API when `id_token` is missing in newer `agy` (v1.1.27+) credential payloads, fixing "unknown email" errors.
+- **Environment Doctor (`agy-switch doctor`)**: Added a comprehensive diagnostic subcommand to check OS, WSL detection, D-Bus session, keyring backend, active account, and running `agy` processes.
+- **Unified Entry Point**: Integrated local adapter into core `agy_switch.py`, simplifying installation and making CLI launchers work out-of-the-box across Linux, WSL2, macOS, and Windows.
+- **Documentation**: Added post-mortem incident report and lessons learned (`LESSONS_LEARNED.md`).
+
 ## v0.2.0 - 2026-09-27
 
 - Bind saved accounts to Git projects, with isolated CLI credentials so projects can use different accounts at the same time on the WSL file credential setup.
