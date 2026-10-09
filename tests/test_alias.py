@@ -151,6 +151,30 @@ class AliasTests(unittest.TestCase):
             self.assertIn("2011", saved)
             self.assertNotIn("renkz2011@gmail.com", saved)
 
+    def test_resolve_token_email_without_id_token(self):
+        token_data = {
+            "token": {
+                "access_token": "mock-access-token",
+                "refresh_token": "mock-refresh-token",
+            },
+            "auth_method": "consumer",
+        }
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps({"email": "fetched@gmail.com"}).encode("utf-8")
+        mock_response.__enter__.return_value = mock_response
+
+        with patch("urllib.request.urlopen", return_value=mock_response):
+            email = app.resolve_token_email(token_data)
+            self.assertEqual(email, "fetched@gmail.com")
+            self.assertEqual(token_data.get("email"), "fetched@gmail.com")
+
+    def test_resolve_token_email_cached_or_claims(self):
+        self.assertEqual(app.resolve_token_email({"email": "direct@gmail.com"}), "direct@gmail.com")
+        self.assertEqual(
+            app.resolve_token_email({"id_token": "a.eyJlbWFpbCI6ICJjbGFpbXNAZ21haWwuY29tIn0=.c"}),
+            "claims@gmail.com"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

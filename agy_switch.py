@@ -283,9 +283,8 @@ def set_current_keyring_token(data: dict):
 
 def delete_current_keyring_token():
     try:
-        if keyring.get_password(SERVICE_NAME, ACTIVE_USERNAME):
-            keyring.delete_password(SERVICE_NAME, ACTIVE_USERNAME)
-    except keyring.errors.PasswordDeleteError:
+        keyring.delete_password(SERVICE_NAME, ACTIVE_USERNAME)
+    except Exception:
         pass
 
 
@@ -529,6 +528,7 @@ def save_profile(name: str, email: str, data: dict):
     save_meta(meta)
     
     # 2. Save actual token to keyring
+    data["email"] = email
     keyring.set_password(PROFILE_SERVICE, email, json.dumps(data))
 
 
@@ -554,11 +554,60 @@ def delete_profile(name: str):
                 pass
 
 
+def resolve_token_email(data: dict) -> str:
+    """Extract email from data, id_token, or by querying Google tokeninfo."""
+    if not isinstance(data, dict):
+        return "未知邮箱"
+
+    if data.get("email"):
+        return data["email"]
+
+    claims = parse_id_token(data.get("id_token", ""))
+    if claims.get("email"):
+        data["email"] = claims["email"]
+        return claims["email"]
+
+    token = data.get("token")
+    if isinstance(token, dict) and token.get("email"):
+        data["email"] = token["email"]
+        return token["email"]
+
+    access = token.get("access_token") if isinstance(token, dict) else None
+    if access:
+        try:
+            req = request.Request(
+                f"https://oauth2.googleapis.com/tokeninfo?access_token={access}",
+                headers={"User-Agent": "antigravity"},
+            )
+            with request.urlopen(req, timeout=5) as resp:
+                info = json.load(resp)
+                if info.get("email"):
+                    data["email"] = info["email"]
+                    return info["email"]
+        except Exception:
+            pass
+
+    try:
+        new_access = refresh_quota_token(data)
+        req = request.Request(
+            f"https://oauth2.googleapis.com/tokeninfo?access_token={new_access}",
+            headers={"User-Agent": "antigravity"},
+        )
+        with request.urlopen(req, timeout=5) as resp:
+            info = json.load(resp)
+            if info.get("email"):
+                data["email"] = info["email"]
+                return info["email"]
+    except Exception:
+        pass
+
+    return "未知邮箱"
+
+
 def get_token_summary(data: dict):
     if not data:
         return None
-    claims = parse_id_token(data.get("id_token", ""))
-    email = claims.get("email") or "未知邮箱"
+    email = resolve_token_email(data)
     exp = data.get("token", {}).get("expiry", "无过期时间")
     has_refresh = bool(data.get("token", {}).get("refresh_token"))
     return {
