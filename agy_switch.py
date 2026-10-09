@@ -22,6 +22,8 @@ from urllib import request, parse, error
 
 try:
     import keyring
+    from keyring.backend import KeyringBackend
+    from keyring.errors import PasswordDeleteError
 except ImportError:
     print("\033[91m错误: 未找到 keyring 模块。请先运行 `pip install keyring`。\033[0m")
     sys.exit(1)
@@ -35,6 +37,9 @@ OLD_ACCOUNTS_DIR = CONFIG_DIR / "accounts"
 META_FILE = CONFIG_DIR / "accounts_meta.json"
 PROJECTS_FILE = CONFIG_DIR / "agy-switch" / "projects.json"
 PROJECT_HOMES_DIR = CONFIG_DIR / "agy-switch" / "project-homes"
+CREDENTIALS_DIR = CONFIG_DIR / "agy-switch" / "credentials"
+ACTIVE_TOKEN_FILE = CONFIG_DIR / "antigravity-cli" / "antigravity-oauth-token"
+STANDALONE_TOKEN_FILE = CONFIG_DIR / "antigravity-cli" / "jetski-standalone-oauth-token"
 
 # ANSI Colors
 GREEN = "\033[92m"
@@ -56,6 +61,231 @@ LOCAL_FILE_BACKEND = False
 
 class QuotaError(Exception):
     pass
+
+
+def detect_environment() -> dict:
+    """Detect current OS, WSL environment, D-Bus session, and available credential backends."""
+    is_wsl = False
+    try:
+        if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+            is_wsl = True
+        elif Path("/proc/version").is_file():
+            version_text = Path("/proc/version").read_text(encoding="utf-8", errors="ignore").lower()
+            if "microsoft" in version_text or "wsl" in version_text:
+                is_wsl = True
+    except Exception:
+        pass
+
+    dbus_addr = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+    has_dbus = bool(dbus_addr)
+
+    has_secretservice = False
+    ss_error = None
+    if has_dbus:
+        try:
+            from keyring.backends.SecretService import Keyring as SSKeyring
+            ss = SSKeyring()
+            ss.get_password("__probe__", "__probe__")
+            has_secretservice = True
+        except Exception as exc:
+            ss_error = str(exc)
+    else:
+        ss_error = "未设置 DBUS_SESSION_BUS_ADDRESS 环境变量"
+
+    if sys.platform == "darwin":
+        active_backend = "keychain"
+    elif sys.platform == "win32":
+        active_backend = "winvault"
+    elif has_secretservice:
+        active_backend = "secretservice"
+    else:
+        active_backend = "file"
+
+    return {
+        "platform": sys.platform,
+        "is_wsl": is_wsl,
+        "has_dbus": has_dbus,
+        "dbus_address": dbus_addr,
+        "has_secretservice": has_secretservice,
+        "secretservice_error": ss_error,
+        "active_backend": active_backend,
+    }
+
+
+class AdaptiveKeyring(KeyringBackend):
+    """Adaptive keyring backend that bridges SecretService with file fallbacks.
+
+    - On Linux with active SecretService (native Linux or modern WSL2 with D-Bus):
+      Active credentials delegate to SecretService (matching agy's go-keyring)
+      while synchronizing with local token files.
+    - On headless Linux, legacy WSL without D-Bus, or container environments:
+      Active credentials automatically fall back to local owner-only files (0o600).
+    - Saved profile credentials (gemini-accounts) are reliably persisted in
+      ~/.gemini/agy-switch/credentials/{sha256(email)}.json and mirrored to
+      SecretService if available.
+    """
+    priority = 1
+
+    def __init__(self, env: dict | None = None):
+        super().__init__()
+        self._env = env if env is not None else detect_environment()
+        self._ss = None
+        if self._env.get("has_secretservice"):
+            try:
+                from keyring.backends.SecretService import Keyring as SSKeyring
+                self._ss = SSKeyring()
+            except Exception:
+                self._ss = None
+
+    def _profile_path(self, username: str) -> Path:
+        digest = hashlib.sha256(username.encode("utf-8")).hexdigest()
+        return CREDENTIALS_DIR / f"{digest}.json"
+
+    # ---- active credential helpers ----
+
+    def _active_get(self) -> str | None:
+        if self._ss is not None:
+            try:
+                val = self._ss.get_password(SERVICE_NAME, ACTIVE_USERNAME)
+                if val:
+                    return val
+            except Exception:
+                pass
+        for p in (ACTIVE_TOKEN_FILE, STANDALONE_TOKEN_FILE):
+            try:
+                if p.is_file():
+                    return p.read_text(encoding="utf-8")
+            except Exception:
+                pass
+        return None
+
+    def _active_set(self, password: str):
+        if self._ss is not None:
+            try:
+                self._ss.set_password(SERVICE_NAME, ACTIVE_USERNAME, password)
+            except Exception:
+                pass
+        for p in (ACTIVE_TOKEN_FILE, STANDALONE_TOKEN_FILE):
+            p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd, temp = tempfile.mkstemp(prefix=".credential-", dir=p.parent)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    stream.write(password)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.chmod(temp, 0o600)
+                os.replace(temp, p)
+            finally:
+                if os.path.exists(temp):
+                    os.unlink(temp)
+
+    def _active_delete(self):
+        deleted = False
+        if self._ss is not None:
+            try:
+                self._ss.delete_password(SERVICE_NAME, ACTIVE_USERNAME)
+                deleted = True
+            except Exception:
+                pass
+        for p in (ACTIVE_TOKEN_FILE, STANDALONE_TOKEN_FILE):
+            try:
+                p.unlink()
+                deleted = True
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+        if not deleted:
+            raise PasswordDeleteError("Credential does not exist")
+
+    # ---- profile credential helpers ----
+
+    def _profile_get(self, username: str) -> str | None:
+        p = self._profile_path(username)
+        if p.is_file():
+            try:
+                return p.read_text(encoding="utf-8")
+            except Exception:
+                pass
+        if self._ss is not None:
+            try:
+                return self._ss.get_password(PROFILE_SERVICE, username)
+            except Exception:
+                pass
+        return None
+
+    def _profile_set(self, username: str, password: str):
+        p = self._profile_path(username)
+        p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd, temp = tempfile.mkstemp(prefix=".credential-", dir=p.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(password)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(temp, 0o600)
+            os.replace(temp, p)
+        finally:
+            if os.path.exists(temp):
+                os.unlink(temp)
+        if self._ss is not None:
+            try:
+                self._ss.set_password(PROFILE_SERVICE, username, password)
+            except Exception:
+                pass
+
+    def _profile_delete(self, username: str):
+        deleted = False
+        p = self._profile_path(username)
+        try:
+            p.unlink()
+            deleted = True
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+        if self._ss is not None:
+            try:
+                self._ss.delete_password(PROFILE_SERVICE, username)
+                deleted = True
+            except Exception:
+                pass
+        if not deleted:
+            raise PasswordDeleteError("Credential does not exist")
+
+    # ---- keyring interface ----
+
+    def get_password(self, service: str, username: str) -> str | None:
+        if service == SERVICE_NAME and username == ACTIVE_USERNAME:
+            return self._active_get()
+        if service == PROFILE_SERVICE:
+            return self._profile_get(username)
+        if self._ss is not None:
+            try:
+                return self._ss.get_password(service, username)
+            except Exception:
+                pass
+        return None
+
+    def set_password(self, service: str, username: str, password: str):
+        if service == SERVICE_NAME and username == ACTIVE_USERNAME:
+            self._active_set(password)
+            return
+        if service == PROFILE_SERVICE:
+            self._profile_set(username, password)
+            return
+        if self._ss is not None:
+            self._ss.set_password(service, username, password)
+
+    def delete_password(self, service: str, username: str):
+        if service == SERVICE_NAME and username == ACTIVE_USERNAME:
+            self._active_delete()
+            return
+        if service == PROFILE_SERVICE:
+            self._profile_delete(username)
+            return
+        if self._ss is not None:
+            self._ss.delete_password(service, username)
 
 
 def agy_binary():
@@ -487,7 +717,14 @@ def prepare_project_home(root, email, payload):
             json.dump(payload, stream)
             stream.flush()
             os.fsync(stream.fileno())
+        os.chmod(temp, 0o600)
         os.replace(temp, token_file)
+        standalone_token = auth_dir / "jetski-standalone-oauth-token"
+        try:
+            if not standalone_token.exists() and not standalone_token.is_symlink():
+                standalone_token.symlink_to(token_file.name)
+        except Exception:
+            pass
     finally:
         if os.path.exists(temp):
             os.unlink(temp)
@@ -1034,7 +1271,86 @@ def cmd_remove(args):
         print("操作已取消。")
 
 
+def cmd_doctor(args):
+    env = detect_environment()
+    print(f"\n{BOLD}=== agy-switch 环境诊断 ==={RESET}")
+
+    # 1. Platform & OS
+    platform_name = {
+        "linux": "Linux",
+        "darwin": "macOS",
+        "win32": "Windows",
+    }.get(env["platform"], env["platform"])
+    wsl_str = f" ({YELLOW}WSL 环境{RESET})" if env["is_wsl"] else f" ({GREEN}原生 Linux{RESET})" if env["platform"] == "linux" else ""
+    print(f"  • {BOLD}操作系统{RESET}: {platform_name}{wsl_str}")
+
+    # 2. D-Bus & SecretService
+    if env["platform"] == "linux":
+        if env["has_dbus"]:
+            print(f"  • {BOLD}D-Bus 会话{RESET}: {GREEN}正常{RESET} ({env['dbus_address']})")
+        else:
+            print(f"  • {BOLD}D-Bus 会话{RESET}: {YELLOW}未检测到 (无头终端或未启动 D-Bus){RESET}")
+
+        if env["has_secretservice"]:
+            print(f"  • {BOLD}系统密钥环 (SecretService){RESET}: {GREEN}可用{RESET}")
+        else:
+            print(f"  • {BOLD}系统密钥环 (SecretService){RESET}: {YELLOW}不可用 ({env['secretservice_error']}){RESET}")
+
+    # 3. Active Backend
+    backend_desc = {
+        "secretservice": f"{GREEN}SecretService (系统密钥环){RESET} + 本地文件同步",
+        "file": f"{YELLOW}本地保护文件 (0600){RESET} [WSL / 无头模式]",
+        "keychain": f"{GREEN}macOS Keychain{RESET}",
+        "winvault": f"{GREEN}Windows Credential Manager{RESET}",
+    }.get(env["active_backend"], env["active_backend"])
+    print(f"  • {BOLD}活跃凭据后端{RESET}: {backend_desc}")
+
+    # 4. Profile storage
+    cred_count = len(list(CREDENTIALS_DIR.glob("*.json"))) if CREDENTIALS_DIR.is_dir() else 0
+    print(f"  • {BOLD}多账号档案库{RESET}: {CREDENTIALS_DIR} ({cred_count} 个档案)")
+
+    # 5. agy executable
+    binary = agy_binary()
+    if binary:
+        version_str = "未知版本"
+        try:
+            res = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=2)
+            if res.returncode == 0 and res.stdout.strip():
+                version_str = res.stdout.strip().splitlines()[0]
+        except Exception:
+            pass
+        print(f"  • {BOLD}agy 可执行文件{RESET}: {GREEN}{binary}{RESET} ({version_str})")
+    else:
+        print(f"  • {BOLD}agy 可执行文件{RESET}: {RED}未在 PATH 中找到 agy{RESET}")
+
+    # 6. Current account
+    meta = load_meta()
+    cur_data = get_current_keyring_token()
+    cur_summary = get_token_summary(cur_data) if cur_data else None
+    if cur_summary and cur_summary.get("email"):
+        matched_alias = next((k for k, v in meta.items() if v.get("email") == cur_summary["email"]), "未设置别名")
+        print(f"  • {BOLD}当前活跃账号{RESET}: {GREEN}{cur_summary['email']}{RESET} (别名: {matched_alias})")
+    else:
+        print(f"  • {BOLD}当前活跃账号{RESET}: {YELLOW}未检测到登录账号{RESET}")
+
+    # 7. Running processes
+    running = find_running_agy_processes()
+    if running:
+        pids = ", ".join(str(p) for p in running)
+        print(f"  • {BOLD}运行中 agy 进程{RESET}: {YELLOW}{len(running)} 个 (PID: {pids}){RESET}")
+    else:
+        print(f"  • {BOLD}运行中 agy 进程{RESET}: {GREEN}无{RESET}")
+
+    print()
+
+
 def main():
+    # Automatically install adaptive keyring
+    try:
+        keyring.set_keyring(AdaptiveKeyring())
+    except Exception:
+        pass
+
     # The interactive shell's `agy` function forwards here. Keep agy flags
     # untouched, including flags unknown to this account manager.
     if len(sys.argv) > 1 and sys.argv[1] == "--launch-agy":
@@ -1090,6 +1406,10 @@ def main():
     p_rm = subparsers.add_parser("remove", aliases=["rm"], help="删除指定的账号档案")
     p_rm.add_argument("name", help="要删除的档案别名或邮箱")
     p_rm.set_defaults(func=cmd_remove)
+
+    # doctor
+    p_doc = subparsers.add_parser("doctor", help="诊断运行环境、D-Bus、系统密钥环与凭据存储后端")
+    p_doc.set_defaults(func=cmd_doctor)
 
     if len(sys.argv) == 1:
         email = project_account()
